@@ -7,7 +7,7 @@ env:
     AWS_REGION: us-west-2                 # or rely on project default
     # If you want deploy.js to do the prod install (default), leave INSTALL_CMD alone.
     # If you want to SKIP npm install inside deploy.js (because you did it earlier), set:
-    # INSTALL_CMD: "true"
+    # Removed this to update and see if push updates shizz
 phases:
   install:
     runtime-versions:
