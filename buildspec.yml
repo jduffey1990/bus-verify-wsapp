@@ -1,0 +1,29 @@
+version: 0.2
+
+env:
+  variables:
+    FUNCTION_NAME: brandora-verify  # your existing Lambda
+    ALIAS: prod                           # optional; omit if you don't use an alias
+    AWS_REGION: us-west-2                 # or rely on project default
+    # If you want deploy.js to do the prod install (default), leave INSTALL_CMD alone.
+    # If you want to SKIP npm install inside deploy.js (because you did it earlier), set:
+    # INSTALL_CMD: "true"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20   # match your Lambda runtime if possible
+    commands:
+      # If you prefer deploy.js to handle npm install, you don't need anything here.
+      # If you'd rather install here (and skip in deploy.js), do:
+      # - npm ci --omit=dev
+  build:
+    commands:
+      - node -v
+      - npm -v
+      # Run your existing deploy script (it: npm ci --omit=dev → zip → update-function-code → alias)
+      - node deploy.js
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: no
+
