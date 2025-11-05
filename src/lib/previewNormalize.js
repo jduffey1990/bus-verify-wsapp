@@ -1,27 +1,66 @@
 // src/lib/previewNormalize.js
+const { normalizeAddress } = require('./addressNormalize');
+
 function hostFrom(url) {
   try { return new URL(url).hostname.replace(/^www\./i, ''); } catch { return null; }
 }
+
 function s2Favicon(host) {
   return host ? `https://www.google.com/s2/favicons?domain=${host}&sz=64` : null;
 }
+
 function nonEmpty(v) {
   if (v === undefined || v === null) return false;
   if (typeof v === 'string') return v.trim().length > 0;
   return true;
 }
+
 function first(...vals) {
   for (const v of vals) if (nonEmpty(v)) return v;
   return null;
 }
+
 function isLinkedIn(u) {
   return typeof u === 'string' && /(^|\.)linkedin\.com/i.test(u);
 }
 
 /**
- * Mutates and returns `body` with normalized top-level fields:
- * name, website, shortDescription, foundingYear, ceoName, headquartersAddress, location, favicon, image.
- * Prefers deterministic sources (Places/URL/OG) over model enrichment; never uses LinkedIn as website.
+ * Remove all null/undefined/empty values from an object recursively
+ */
+function stripNulls(obj) {
+  if (Array.isArray(obj)) {
+    return obj.filter(item => item !== null && item !== undefined && item !== '');
+  }
+  
+  if (obj && typeof obj === 'object') {
+    const cleaned = {};
+    for (const [key, value] of Object.entries(obj)) {
+      // Skip null, undefined, empty strings
+      if (value === null || value === undefined || value === '') continue;
+      
+      // Recursively clean nested objects
+      if (typeof value === 'object') {
+        const cleanedValue = stripNulls(value);
+        // Only add if object/array has content
+        if (Array.isArray(cleanedValue) && cleanedValue.length > 0) {
+          cleaned[key] = cleanedValue;
+        } else if (!Array.isArray(cleanedValue) && Object.keys(cleanedValue).length > 0) {
+          cleaned[key] = cleanedValue;
+        }
+      } else {
+        cleaned[key] = value;
+      }
+    }
+    return cleaned;
+  }
+  
+  return obj;
+}
+
+/**
+ * Normalize and clean response body
+ * In production: removes debug info, nulls, and duplicate data
+ * In development: keeps enrichment data for debugging
  */
 function normalizePreview(body = {}) {
   const kind = body.kind || null;
@@ -29,6 +68,7 @@ function normalizePreview(body = {}) {
   const place = body.place || {};
   const enr = body.enrichment || {};
   const req = body.request || {};
+  const isProd = process.env.NODE_ENV === 'production';
 
   // NAME
   const name = first(
@@ -58,18 +98,48 @@ function normalizePreview(body = {}) {
   );
   body.shortDescription = shortDescription || null;
 
-  // FOUNDING YEAR / CEO / HQ
+  // FOUNDING YEAR
   body.foundingYear = first(body.foundingYear, enr.foundingYear);
-  body.ceoName = first(body.ceoName, enr.ceoName);
-  body.headquartersAddress = first(body.headquartersAddress, place.address, enr.headquartersAddress);
 
-  // LOCATION for map pin
+  // LEADERSHIP DATA - use the structured leaderData object, not individual fields
+  if (body.leaderData && Object.keys(body.leaderData).length > 0) {
+    // Keep leaderData as-is
+  } else {
+    delete body.leaderData; // Remove if empty
+  }
+  
+  // Remove legacy ceoName field - replaced by leaderData
+  delete body.ceoName;
+
+  // HQ ADDRESS - normalize to consistent format
+  const rawHqAddress = first(body.headquartersAddress, place.address, enr.headquartersAddress);
+  body.headquartersAddress = normalizeAddress(rawHqAddress);
+
+  // LOCATION for map pin (only if from place data)
   body.location = first(body.location, place.location) || null;
 
-  // IMAGE: prefer OG image, then LinkedIn/company logo if you ever set it, else null
-  body.image = first(body.image, og.image) || null;
+  // CONTACT INFO - only include if present
+  body.phone = first(body.phone, place.phone, enr.phone);
+  body.email = first(body.email, place.email, enr.email);
 
-  // FAVICON: choose from website host, or the preview host, or LinkedIn, or gmaps
+  // IMAGE: prefer OG image, but handle LinkedIn hotlink blocking
+  const ogImage = og.image || null;
+  const imageInfo = og.imageAnalysis || {};
+  
+  // For LinkedIn, don't duplicate image in top-level if it's hotlink-blocked
+  if (kind === 'linkedin' && imageInfo.hotlinkBlocked) {
+    body.image = null; // Keep only in meta for reference
+  } else {
+    body.image = first(body.image, ogImage) || null;
+  }
+  
+  // LinkedIn-specific: only include 'limited' if true
+  if (kind === 'linkedin' && !body.limited) {
+    delete body.limited;
+    delete body.limited_reason;
+  }
+
+  // FAVICON
   const siteHost = hostFrom(body.website);
   const previewHost =
     body.host ||
@@ -78,7 +148,48 @@ function normalizePreview(body = {}) {
     (place.mapLink ? hostFrom(place.mapLink) : null);
   body.favicon = first(body.favicon, s2Favicon(website));
 
-  return body;
+  // PRODUCTION CLEANUP
+  if (isProd) {
+    // Remove debug/internal fields
+    delete body.enrichment;
+    delete body._raw;
+    delete body.jsonLdBlocks;
+    
+    // Remove duplicate/redundant data
+    if (body.url === body.website) {
+      delete body.url; // url is just canonical, keep website
+    }
+    
+    // Simplify structured data - remove if it's just echoing top-level fields
+    if (body.structured) {
+      const hasUniqueData = 
+        body.structured.email || 
+        body.structured.telephone ||
+        body.structured.addressComponents;
+      
+      if (!hasUniqueData) {
+        delete body.structured; // Top-level fields already have this info
+      }
+    }
+    
+    // Simplify dataSources to just a boolean flag
+    if (body.dataSources) {
+      body.enrichedWithAI = body.dataSources.enrichedWithAI || false;
+      body.hasStructuredData = body.dataSources.hasJsonLd || false;
+      delete body.dataSources;
+    }
+  } else {
+    // DEVELOPMENT: Keep enrichment but clean it up
+    if (body.enrichment) {
+      // Remove fields that were already null/not used
+      if (!body.enrichment.leaderData) delete body.enrichment.leaderData;
+      if (!body.enrichment.sources) delete body.enrichment.sources;
+      if (body.enrichment.leaderConfidence === null) delete body.enrichment.leaderConfidence;
+    }
+  }
+
+  // FINAL CLEANUP: Strip all nulls, empty strings, empty objects
+  return stripNulls(body);
 }
 
 module.exports = { normalizePreview };

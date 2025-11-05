@@ -7,7 +7,10 @@
     "deploy": "node deploy.js"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "cheerio": "^1.1.2",
+    "express": "^5.1.0",
+    "he": "^1.2.0",
+    "jsonld": "^8.3.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

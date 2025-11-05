@@ -2,53 +2,54 @@
 const { askOpenAI, setIfMissing, CFG } = require('./_enrichBase');
 const { normalizePreview } = require('./previewNormalize');
 
-function buildFacts(body) {
-  const name = body?.request?.name
-    || (body?.meta?.title ? body.meta.title.replace(/\|\s*LinkedIn/i, '').trim() : null)
-    || null;
-  const linkedinUrl = body?.url || null;
-  const og = body?.meta || {}; // { title, description, image }
-  return { name, linkedinUrl, og };
-}
-
 function isLinkedIn(u) {
   return typeof u === 'string' && /(^|\.)linkedin\.com/i.test(u);
 }
 
-function ensureAllKeys(obj) {
-  // LinkedIn variant: no shortDescription, no founders
-  const shape = {
-    canonicalName: null,
-    website: null,
-    foundingYear: null,
-    headquartersAddress: null,
-    ceoName: null,
-    categories: null,
-    confidence: null,
-    sources: null,
+function buildFacts(body) {
+  const meta = body?.meta || {};
+  const request = body?.request || {};
+  
+  // Extract name, cleaning LinkedIn suffix
+  const name = request.name
+    || (meta.title ? meta.title.replace(/\|\s*LinkedIn/i, '').trim() : null)
+    || null;
+  
+  const linkedinUrl = body?.url || null;
+  const description = meta.description || null;
+  
+  // Determine what fields are missing
+  const missingFields = [];
+  if (!name) missingFields.push('canonicalName');
+  if (!body.website) missingFields.push('website');
+  if (!body.foundingYear) missingFields.push('foundingYear');
+  if (!body.headquartersAddress) missingFields.push('headquartersAddress');
+  if (!body.categories) missingFields.push('categories');
+  
+  return {
+    name,
+    linkedinUrl,
+    description,
+    missingFields
   };
-  for (const k of Object.keys(shape)) if (!(k in obj)) obj[k] = shape[k];
-  return obj;
 }
 
-// Per-field merge thresholds (LinkedIn: be a bit stricter on CEO/year/HQ than categories)
-const FIELD_THRESHOLDS = {
-  canonicalName: CFG.min_conf,           // e.g., 0.5
-  website:      Math.max(CFG.min_conf, 0.55),
-  foundingYear: Math.max(CFG.min_conf, 0.6),
-  headquartersAddress: Math.max(CFG.min_conf, 0.6),
-  ceoName:      Math.max(CFG.min_conf, 0.7),
-  categories:   CFG.min_conf,            // e.g., 0.5
-};
-
-function passes(field, conf) {
-  if (conf == null) return true; // if model didn’t report a confidence, allow it
-  const th = FIELD_THRESHOLDS[field] ?? CFG.min_conf;
-  return conf >= th;
+/**
+ * Determine if AI enrichment is needed
+ */
+function needsEnrichment(facts) {
+  // Always need enrichment for LinkedIn - rarely has structured data
+  const criticalFields = ['name', 'website', 'categories'];
+  const missingCritical = facts.missingFields.some(f => criticalFields.includes(f));
+  
+  return missingCritical || facts.missingFields.length > 1;
 }
 
 async function handle(lambdaResponse) {
-  const headers = lambdaResponse?.headers || { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  const headers = lambdaResponse?.headers || {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*'
+  };
   const statusCode = lambdaResponse?.statusCode ?? 200;
   const body = typeof lambdaResponse?.body === 'string'
     ? JSON.parse(lambdaResponse.body)
@@ -56,77 +57,197 @@ async function handle(lambdaResponse) {
 
   const facts = buildFacts(body);
 
-  // Pre-fill only the safe bit: a canonical-ish name from request/title
+  // Pre-fill name from LinkedIn title
   setIfMissing(body, 'name', facts.name);
 
-  // Free-flowing, but with confidence + guardrails
-  const system =
-    'You are a company metadata normalizer for a LinkedIn company page. ' +
-    'Use your world knowledge PLUS the provided LinkedIn OG text. ' +
-    'Aim to fill as many fields as reasonably possible. If unsure, provide a best-guess with lower confidence; if you cannot guess, use null. ' +
-    'NEVER return a LinkedIn URL as the official website. Do NOT include LinkedIn in sources. ' +
-    'Return ONLY valid JSON that matches the schema. No explanations.';
-
-  const userPayload = {
-    task: 'Fill company fields from a LinkedIn company URL + OG metadata. Provide best-guess values with an appropriate confidence.',
-    inputs: facts,
-    required_output_schema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        canonicalName:       { type: ['string','null'] },
-        website:             { type: ['string','null'], description: 'Official homepage (never LinkedIn).' },
-        foundingYear:        { type: ['integer','null'], minimum:1600, maximum:2100 },
-        headquartersAddress: { type: ['string','null'] },
-        ceoName:             { type: ['string','null'] },
-        categories:          { type: ['array','null'], items: { type:'string' } },
-        confidence:          { type: ['number','null'], minimum: 0, maximum: 1 },
-        sources:             { type: ['array','null'], items: { type:'string' } },
-      },
-      // no "required" list -> let model leave nulls
-    },
-    rules: [
-      'Do not return a LinkedIn URL for website.',
-      'Exclude any LinkedIn URLs from sources.',
-      'Prefer broad industry categories (e.g., Apparel, Retail, E-commerce).',
-      'If you guess a value, lower the confidence accordingly.',
-      'Wikipedia and reputable news/business directories are acceptable sources.',
-    ],
+  // Add metadata about data sources
+  body.dataSources = {
+    hasJsonLd: false, // LinkedIn rarely has JSON-LD
+    hasOpenGraph: !!body?.meta?.description,
+    enrichedWithAI: false
   };
 
-  const enr = await askOpenAI({ system, userPayload });
+  // Only enrich if needed
+  if (needsEnrichment(facts)) {
+    const system =
+      'You are a company metadata normalizer for LinkedIn company pages. ' +
+      'Use your world knowledge PLUS the provided LinkedIn metadata. ' +
+      'CRITICAL: NEVER return a LinkedIn URL as the official website. ' +
+      'Prioritize accuracy - if unsure, return null and lower confidence. ' +
+      'Return ONLY valid JSON matching the schema.';
 
-  if (enr.ok && enr.data) {
-    // sanitize: never LinkedIn website; strip LinkedIn from sources
-    if (isLinkedIn(enr.data.website)) enr.data.website = null;
-    if (Array.isArray(enr.data.sources)) {
-      enr.data.sources = enr.data.sources.filter((s) => s && !isLinkedIn(s));
-      if (!enr.data.sources.length) enr.data.sources = null;
-    }
+    const userPayload = {
+      task: `Fill missing company fields from LinkedIn: [${facts.missingFields.join(', ')}]`,
+      inputs: {
+        name: facts.name,
+        linkedinUrl: facts.linkedinUrl,
+        description: facts.description
+      },
+      required_output_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          canonicalName:       { type: ['string','null'] },
+          website:             { type: ['string','null'], description: 'Official homepage - NEVER LinkedIn' },
+          foundingYear:        { type: ['integer','null'], minimum: 1600, maximum: 2100 },
+          headquartersAddress: { type: ['string','null'] },
+          leaderData:          { 
+            type: ['object','null'],
+            description: 'C-suite executives. Keys: ceo, cto, cfo, coo, founder. Values: full names.',
+            properties: {
+              ceo: { type: ['string','null'] },
+              cto: { type: ['string','null'] },
+              cfo: { type: ['string','null'] },
+              coo: { type: ['string','null'] },
+              founder: { type: ['string','null'] }
+            },
+            additionalProperties: false
+          },
+          categories:          { type: ['array','null'], items: { type: 'string' } },
+          confidence:          { type: 'number', minimum: 0, maximum: 1 },
+          leaderConfidence:    { type: ['number','null'], minimum: 0, maximum: 1 },
+          sources:             { type: ['array','null'], items: { type: 'string' } }
+        }
+      },
+      rules: [
+        'CRITICAL: NEVER return LinkedIn URLs for website or in sources array',
+        'Only fill fields in the missingFields list',
+        'Use broad industry categories (max 3): Technology, Retail, Healthcare, Finance, etc.',
+        'LinkedIn-specific: Be more conservative - use 0.6+ confidence for most fields, 0.7+ for leadership',
+        'If guessing without strong evidence, set confidence to 0.5 or lower',
+        'Leadership: Only include if confidence >0.7 and you have strong evidence',
+        'Set leaderConfidence separately - be MORE conservative with people names',
+        'Address format: Return as "City, State" for US (e.g., "San Francisco, CA") or "City, Country" for international',
+        'Address format: Do NOT include street addresses or zip codes in headquartersAddress'
+      ]
+    };
 
-    const data = ensureAllKeys(enr.data);
-    body.enrichment = data;
+    const enr = await askOpenAI({ system, userPayload });
 
-    const conf = typeof data.confidence === 'number' ? data.confidence : null;
+    if (enr.ok && enr.data) {
+      // CRITICAL: Sanitize LinkedIn URLs
+      if (isLinkedIn(enr.data.website)) {
+        console.warn('AI returned LinkedIn URL as website - rejecting');
+        enr.data.website = null;
+      }
+      
+      if (Array.isArray(enr.data.sources)) {
+        enr.data.sources = enr.data.sources.filter(s => s && !isLinkedIn(s));
+        if (!enr.data.sources.length) enr.data.sources = null;
+      }
 
-    // merge non-destructively with per-field thresholds
-    if (passes('canonicalName', conf)) setIfMissing(body, 'name', data.canonicalName);
-    if (passes('website', conf) && data.website && !isLinkedIn(data.website)) {
-      setIfMissing(body, 'website', data.website);
-    }
-    if (passes('foundingYear', conf)) setIfMissing(body, 'foundingYear', data.foundingYear);
-    if (passes('headquartersAddress', conf)) setIfMissing(body, 'headquartersAddress', data.headquartersAddress);
-    if (passes('ceoName', conf)) setIfMissing(body, 'ceoName', data.ceoName);
-    if (!body.categories && passes('categories', conf) && data.categories) {
-      body.categories = data.categories;
+      // Per-field confidence thresholds (LinkedIn: stricter than website scraping)
+      const conf = typeof enr.data.confidence === 'number' ? enr.data.confidence : 0;
+      const leaderConf = typeof enr.data.leaderConfidence === 'number' 
+        ? enr.data.leaderConfidence 
+        : 0;
+      
+      // Field-specific thresholds
+      const thresholds = {
+        canonicalName: Math.max(CFG.min_conf, 0.5),
+        website: Math.max(CFG.min_conf, 0.6),       // Higher: websites are critical
+        foundingYear: Math.max(CFG.min_conf, 0.6),
+        headquartersAddress: Math.max(CFG.min_conf, 0.6),
+        categories: Math.max(CFG.min_conf, 0.5)
+      };
+
+      const passes = (field) => {
+        const threshold = thresholds[field] || CFG.min_conf;
+        return conf >= threshold;
+      };
+
+      const leaderHighEnough = leaderConf >= 0.7;
+
+      // Attach enrichment data
+      body.enrichment = {
+        ...enr.data,
+        appliedToFields: facts.missingFields,
+        wasApplied: conf >= CFG.min_conf,
+        leaderDataApplied: leaderHighEnough
+      };
+
+      body.dataSources.enrichedWithAI = true;
+      body.dataSources.aiConfidence = conf;
+      body.dataSources.leaderConfidence = leaderConf;
+
+      // Merge with field-specific thresholds
+      if (passes('canonicalName')) {
+        setIfMissing(body, 'name', enr.data.canonicalName);
+      }
+      
+      if (passes('website') && enr.data.website && !isLinkedIn(enr.data.website)) {
+        setIfMissing(body, 'website', enr.data.website);
+      }
+      
+      if (passes('foundingYear')) {
+        setIfMissing(body, 'foundingYear', enr.data.foundingYear);
+      }
+      
+      if (passes('headquartersAddress')) {
+        setIfMissing(body, 'headquartersAddress', enr.data.headquartersAddress);
+      }
+
+      // Categories with validation
+      if (!body.categories && passes('categories') && enr.data.categories) {
+        const validCategories = enr.data.categories.filter(cat => 
+          cat && 
+          cat.length > 2 && 
+          cat.length < 50 &&
+          !/lorem|ipsum|test|example/i.test(cat)
+        );
+        if (validCategories.length) {
+          body.categories = validCategories.slice(0, 3);
+        }
+      }
+
+      // Leadership data with strict validation
+      if (leaderHighEnough && enr.data.leaderData && typeof enr.data.leaderData === 'object') {
+        const leaders = {};
+        const validRoles = ['ceo', 'cto', 'cfo', 'coo', 'founder'];
+        
+        for (const [role, name] of Object.entries(enr.data.leaderData)) {
+          if (!validRoles.includes(role.toLowerCase()) || typeof name !== 'string') {
+            continue;
+          }
+          
+          // Reject names with titles/prefixes
+          const invalidPrefixes = /^(ceo|cto|cfo|founder|cofounder|co-founder|president|vp|director|mr\.|ms\.|mrs\.|dr\.)/i;
+          if (invalidPrefixes.test(name.trim())) {
+            console.warn(`Rejecting leader name with prefix: "${name}"`);
+            continue;
+          }
+          
+          // Reject names with descriptive text
+          if (name.includes(':') || name.includes('and others') || name.includes(',')) {
+            console.warn(`Rejecting complex leader description: "${name}"`);
+            continue;
+          }
+          
+          // Must be valid name format
+          if (name.length < 3 || 
+              name.length > 50 ||
+              !/^[A-Za-z\s\-'.]+$/.test(name) ||
+              name.split(' ').length < 2) {
+            continue;
+          }
+          
+          leaders[role.toLowerCase()] = name.trim();
+        }
+        
+        if (Object.keys(leaders).length > 0) {
+          body.leaderData = leaders;
+        }
+      }
     }
   } else {
-    // even on failure, provide a normalized enrichment object for frontend parity
-    body.enrichment = ensureAllKeys({});
+    console.log('Skipping AI enrichment - sufficient data from LinkedIn metadata');
   }
 
-  // extra safety: if something upstream set a LinkedIn site, null it out
-  if (isLinkedIn(body.website)) body.website = null;
+  // Final safety check: ensure no LinkedIn URLs leaked through
+  if (isLinkedIn(body.website)) {
+    console.warn('LinkedIn URL detected in final output - removing');
+    body.website = null;
+  }
 
   const normalized = normalizePreview(body);
   return { statusCode, headers, body: JSON.stringify(normalized) };
