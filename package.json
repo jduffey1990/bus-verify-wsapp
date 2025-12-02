@@ -1,5 +1,5 @@
 {
-  "name": "brandora-verification-microservices",
+  "name": "mozaiq-verification-microservices",
   "scripts": {
     "dev": "nodemon devServer.js",
     "serve": "node devServer.js",
