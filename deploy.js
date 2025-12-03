@@ -55,7 +55,7 @@ function runAndGet(cmd, opts = {}) {
     const DEFAULT_EXCLUDES = [
       '.git',
       ".env",
-      'node_modules',         // we'll rebuild prod deps
+      // 'node_modules',      // REMOVED - we need prod deps in the Lambda package
       'tests',
       '.github',
       '.DS_Store',
