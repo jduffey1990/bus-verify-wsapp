@@ -9,39 +9,162 @@ function s2Favicon(host) {
   return host ? `https://www.google.com/s2/favicons?domain=${host}&sz=64` : null;
 }
 
-function nonEmpty(v) {
-  if (v === undefined || v === null) return false;
-  if (typeof v === 'string') return v.trim().length > 0;
+function nonEmpty(value) {
+  if (value === undefined || value === null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
   return true;
 }
 
-function first(...vals) {
-  for (const v of vals) if (nonEmpty(v)) return v;
+function first(...values) {
+  for (const value of values) {
+    if (nonEmpty(value)) return value;
+  }
   return null;
 }
 
-function isLinkedIn(u) {
-  return typeof u === 'string' && /(^|\.)linkedin\.com/i.test(u);
+function firstArray(...values) {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length > 0) return value;
+  }
+  return null;
+}
+
+function isLinkedIn(url) {
+  return typeof url === 'string' && /(^|\.)linkedin\.com/i.test(url);
+}
+
+function cleanString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function cleanUrl(value) {
+  if (typeof value !== 'string') return null;
+
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  try {
+    const parsed = new URL(trimmed);
+    return /^https?:$/i.test(parsed.protocol) ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function cleanEmail(value) {
+  const email = cleanString(value);
+  if (!email) return null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+
+function cleanYear(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1600 && value <= 2100) {
+    return value;
+  }
+
+  if (typeof value === 'string' && /^\d{4}$/.test(value.trim())) {
+    const year = Number(value.trim());
+    return year >= 1600 && year <= 2100 ? year : null;
+  }
+
+  return null;
+}
+
+function cleanSocialLinks(values) {
+  if (!Array.isArray(values)) return null;
+
+  const seen = new Set();
+  const cleaned = [];
+
+  for (const value of values) {
+    const url = cleanUrl(value);
+    if (!url) continue;
+
+    const key = url.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    cleaned.push(url);
+  }
+
+  return cleaned.length ? cleaned : null;
+}
+
+function cleanCategories(values) {
+  if (!Array.isArray(values)) return null;
+
+  const seen = new Set();
+  const cleaned = [];
+
+  for (const value of values) {
+    const category = cleanString(value);
+    if (!category) continue;
+    if (category.length < 3 || category.length > 50) continue;
+    if (/lorem|ipsum|test|example/i.test(category)) continue;
+
+    const key = category.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    cleaned.push(category);
+
+    if (cleaned.length >= 5) break;
+  }
+
+  return cleaned.length ? cleaned : null;
+}
+
+function cleanLeaderData(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+
+  const cleaned = {};
+  const allowedRoles = ['ceo', 'cto', 'cfo', 'coo', 'founder'];
+
+  for (const role of allowedRoles) {
+    const name = cleanString(value[role]);
+    if (!name) continue;
+    cleaned[role] = name;
+  }
+
+  return Object.keys(cleaned).length ? cleaned : null;
+}
+
+function cleanPlace(place = {}) {
+  if (!place || typeof place !== 'object' || Array.isArray(place)) return null;
+
+  const cleaned = stripNulls({
+    name: cleanString(place.name),
+    address: cleanString(place.address),
+    phone: cleanString(place.phone),
+    website: cleanUrl(place.website),
+    mapLink: cleanUrl(place.mapLink),
+    gmapsUrl: cleanUrl(place.gmapsUrl),
+    rating: typeof place.rating === 'number' ? place.rating : null,
+    reviewsCount: Number.isInteger(place.reviewsCount) ? place.reviewsCount : null,
+    location: place.location && typeof place.location === 'object' ? place.location : null,
+    categories: cleanCategories(place.categories)
+  });
+
+  return Object.keys(cleaned).length ? cleaned : null;
 }
 
 /**
- * Remove all null/undefined/empty values from an object recursively
+ * Remove all null/undefined/empty values from an object recursively.
  */
 function stripNulls(obj) {
   if (Array.isArray(obj)) {
     return obj.filter(item => item !== null && item !== undefined && item !== '');
   }
-  
+
   if (obj && typeof obj === 'object') {
     const cleaned = {};
+
     for (const [key, value] of Object.entries(obj)) {
-      // Skip null, undefined, empty strings
       if (value === null || value === undefined || value === '') continue;
-      
-      // Recursively clean nested objects
+
       if (typeof value === 'object') {
         const cleanedValue = stripNulls(value);
-        // Only add if object/array has content
+
         if (Array.isArray(cleanedValue) && cleanedValue.length > 0) {
           cleaned[key] = cleanedValue;
         } else if (!Array.isArray(cleanedValue) && Object.keys(cleanedValue).length > 0) {
@@ -51,145 +174,109 @@ function stripNulls(obj) {
         cleaned[key] = value;
       }
     }
+
     return cleaned;
   }
-  
+
   return obj;
 }
 
 /**
- * Normalize and clean response body
- * In production: removes debug info, nulls, and duplicate data
- * In development: keeps enrichment data for debugging
+ * Normalize preview responses into a stable contract:
+ * keep persistable brand basics at the top level and quarantine
+ * display-only context under previewOnly.
  */
 function normalizePreview(body = {}) {
-  const kind = body.kind || null;
-  const og = body.meta || {};
+  const kind = cleanString(body.kind);
+  const meta = body.meta || {};
   const place = body.place || {};
-  const enr = body.enrichment || {};
-  const req = body.request || {};
-  const isProd = process.env.NODE_ENV === 'production';
+  const request = body.request || {};
+  const enrichment = body.enrichment || {};
 
-  // NAME
-  const name = first(
+  const name = cleanString(first(
     body.name,
-    req.name,
+    request.name,
     place.name,
-    enr.canonicalName,
-    (og.title && String(og.title).replace(/\|\s*LinkedIn/i, '').trim())
-  );
-  body.name = name || null;
+    enrichment.canonicalName,
+    meta.title ? String(meta.title).replace(/\|\s*LinkedIn/i, '').trim() : null
+  ));
 
-  // WEBSITE (never LinkedIn)
-  let website = first(
+  let website = cleanUrl(first(
     body.website,
     place.website,
-    body.url,    // for website previews, this *is* the site
-    enr.website
-  );
+    kind === 'url' ? body.url : null,
+    enrichment.website
+  ));
   if (isLinkedIn(website)) website = null;
-  body.website = website || null;
 
-  // SHORT DESCRIPTION
-  const shortDescription = first(
+  const shortDescription = cleanString(first(
     body.shortDescription,
-    (og.description && String(og.description).split('\n')[0]),
-    enr.shortDescription
-  );
-  body.shortDescription = shortDescription || null;
+    meta.description ? String(meta.description).split('\n')[0] : null,
+    enrichment.shortDescription
+  ));
 
-  // FOUNDING YEAR
-  body.foundingYear = first(body.foundingYear, enr.foundingYear);
+  const headquartersAddress = normalizeAddress(first(
+    body.headquartersAddress,
+    place.address,
+    enrichment.headquartersAddress
+  ));
 
-  // LEADERSHIP DATA - use the structured leaderData object, not individual fields
-  if (body.leaderData && Object.keys(body.leaderData).length > 0) {
-    // Keep leaderData as-is
-  } else {
-    delete body.leaderData; // Remove if empty
-  }
-  
-  // Remove legacy ceoName field - replaced by leaderData
-  delete body.ceoName;
+  const foundingYear = cleanYear(first(body.foundingYear, enrichment.foundingYear));
+  const email = cleanEmail(first(body.email, place.email, enrichment.email));
+  const socialLinks = cleanSocialLinks(firstArray(body.socialLinks, body.structured?.sameAs));
+  const categories = cleanCategories(firstArray(body.categories, enrichment.categories));
 
-  // HQ ADDRESS - normalize to consistent format
-  const rawHqAddress = first(body.headquartersAddress, place.address, enr.headquartersAddress);
-  body.headquartersAddress = normalizeAddress(rawHqAddress);
-
-  // LOCATION for map pin (only if from place data)
-  body.location = first(body.location, place.location) || null;
-
-  // CONTACT INFO - only include if present
-  body.phone = first(body.phone, place.phone, enr.phone);
-  body.email = first(body.email, place.email, enr.email);
-
-  // IMAGE: prefer OG image, but handle LinkedIn hotlink blocking
-  const ogImage = og.image || null;
-  const imageInfo = og.imageAnalysis || {};
-  
-  // For LinkedIn, don't duplicate image in top-level if it's hotlink-blocked
-  if (kind === 'linkedin' && imageInfo.hotlinkBlocked) {
-    body.image = null; // Keep only in meta for reference
-  } else {
-    body.image = first(body.image, ogImage) || null;
-  }
-  
-  // LinkedIn-specific: only include 'limited' if true
-  if (kind === 'linkedin' && !body.limited) {
-    delete body.limited;
-    delete body.limited_reason;
+  const imageInfo = meta.imageAnalysis && typeof meta.imageAnalysis === 'object'
+    ? meta.imageAnalysis
+    : null;
+  let image = cleanUrl(first(body.image, meta.image));
+  if (kind === 'linkedin' && imageInfo?.hotlinkBlocked) {
+    image = null;
   }
 
-  // FAVICON
-  const siteHost = hostFrom(body.website);
   const previewHost =
     body.host ||
-    siteHost ||
+    hostFrom(website) ||
     (kind === 'linkedin' ? 'www.linkedin.com' : null) ||
-    (place.mapLink ? hostFrom(place.mapLink) : null);
-  body.favicon = first(body.favicon, s2Favicon(website));
+    hostFrom(place.mapLink);
+  const favicon = cleanUrl(first(body.favicon, s2Favicon(previewHost)));
 
-  // PRODUCTION CLEANUP
-  if (isProd) {
-    // Remove debug/internal fields
-    delete body.enrichment;
-    delete body._raw;
-    delete body.jsonLdBlocks;
-    
-    // Remove duplicate/redundant data
-    if (body.url === body.website) {
-      delete body.url; // url is just canonical, keep website
-    }
-    
-    // Simplify structured data - remove if it's just echoing top-level fields
-    if (body.structured) {
-      const hasUniqueData = 
-        body.structured.email || 
-        body.structured.telephone ||
-        body.structured.addressComponents;
-      
-      if (!hasUniqueData) {
-        delete body.structured; // Top-level fields already have this info
-      }
-    }
-    
-    // Simplify dataSources to just a boolean flag
-    if (body.dataSources) {
-      body.enrichedWithAI = body.dataSources.enrichedWithAI || false;
-      body.hasStructuredData = body.dataSources.hasJsonLd || false;
-      delete body.dataSources;
-    }
-  } else {
-    // DEVELOPMENT: Keep enrichment but clean it up
-    if (body.enrichment) {
-      // Remove fields that were already null/not used
-      if (!body.enrichment.leaderData) delete body.enrichment.leaderData;
-      if (!body.enrichment.sources) delete body.enrichment.sources;
-      if (body.enrichment.leaderConfidence === null) delete body.enrichment.leaderConfidence;
-    }
-  }
+  const dataQuality = stripNulls({
+    enrichedWithAI: body.dataSources?.enrichedWithAI ? true : null,
+    hasStructuredData: body.dataSources?.hasJsonLd ? true : null,
+    hasGooglePlaces: body.dataSources?.hasGooglePlaces ? true : null
+  });
 
-  // FINAL CLEANUP: Strip all nulls, empty strings, empty objects
-  return stripNulls(body);
+  const previewOnly = stripNulls({
+    sourceUrl: cleanUrl(first(
+      request.providedUrl,
+      kind === 'address' ? place.mapLink : body.url,
+      kind === 'address' ? null : website
+    )),
+    themeColor: cleanString(meta.themeColor),
+    imageAnalysis: imageInfo,
+    leaderData: cleanLeaderData(body.leaderData),
+    place: cleanPlace(place),
+    dataQuality: Object.keys(dataQuality).length ? dataQuality : null,
+    isStorefront: body.isStorefront === true ? true : null,
+    limited: kind === 'linkedin' && body.limited ? true : null,
+    limitedReason: kind === 'linkedin' ? cleanString(body.limited_reason) : null
+  });
+
+  return stripNulls({
+    kind,
+    name,
+    website,
+    shortDescription,
+    image,
+    favicon,
+    headquartersAddress,
+    foundingYear,
+    email,
+    socialLinks,
+    categories,
+    previewOnly: Object.keys(previewOnly).length ? previewOnly : null
+  });
 }
 
 module.exports = { normalizePreview };
