@@ -39,7 +39,7 @@ function buildFacts(body) {
  */
 function needsEnrichment(facts) {
   // Always need enrichment for LinkedIn - rarely has structured data
-  const criticalFields = ['name', 'website', 'categories'];
+  const criticalFields = ['canonicalName', 'website', 'categories'];
   const missingCritical = facts.missingFields.some(f => criticalFields.includes(f));
   
   return missingCritical || facts.missingFields.length > 1;

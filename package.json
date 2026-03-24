@@ -4,6 +4,7 @@
     "dev": "nodemon devServer.js",
     "serve": "node devServer.js",
     "run-local": "node devServer.js",
+    "test:contract": "node --test test/preview-contract.test.js",
     "deploy": "node deploy.js"
   },
   "dependencies": {
